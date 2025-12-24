@@ -1,0 +1,84 @@
+cabal-version:       2.2
+name:                accelerate-llvm-demo
+version:             0.1.0.0
+synopsis:            Demo showcase for Accelerate LLVM backends
+description:
+    This demo package showcases the Accelerate LLVM backends with
+    real-world examples including Mandelbrot rendering, N-body simulation,
+    and image processing pipelines. Supports both CPU (native) and GPU (PTX)
+    backends with automatic detection and fallback.
+
+license:             BSD-3-Clause
+license-file:        ../LICENSE
+author:              AYUSHMIT
+maintainer:          trevor.mcdonell@gmail.com
+category:            Demo
+build-type:          Simple
+
+extra-source-files:
+    README.md
+    assets/*.png
+
+common common-options
+  default-language:    Haskell2010
+  ghc-options:
+    -Wall
+    -O2
+    -threaded
+    -rtsopts
+    -with-rtsopts=-N
+
+  build-depends:
+      base                 >= 4.14 && < 5
+    , accelerate           >= 1.3
+    , accelerate-llvm      >= 1.3
+    , accelerate-llvm-native >= 1.3
+
+library
+  import:              common-options
+  hs-source-dirs:      src
+  exposed-modules:
+    Demo.Mandelbrot
+    Demo.NBody
+    Demo.Image
+    Demo.Backend
+
+  build-depends:
+      bytestring
+    , vector
+    , JuicyPixels          >= 3.3
+    , colour               >= 2.3
+    , primitive            >= 0.7
+
+executable accelerate-llvm-demo
+  import:              common-options
+  main-is:             Main.hs
+  hs-source-dirs:      app
+  
+  build-depends:
+      accelerate-llvm-demo
+    , optparse-applicative >= 0.16
+    , filepath
+    , directory
+
+benchmark demo-bench
+  import:              common-options
+  type:                exitcode-stdio-1.0
+  main-is:             Bench.hs
+  hs-source-dirs:      bench
+  
+  build-depends:
+      accelerate-llvm-demo
+    , criterion            >= 1.5
+    , deepseq
+
+test-suite demo-tests
+  import:              common-options
+  type:                exitcode-stdio-1.0
+  main-is:             Spec.hs
+  hs-source-dirs:      test
+  
+  build-depends:
+      accelerate-llvm-demo
+    , tasty                >= 1.4
+    , tasty-hunit          >= 0.10

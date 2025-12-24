@@ -1,0 +1,30 @@
+# Haskell build artifacts
+dist-newstyle/
+.stack-work/
+*.hi
+*.o
+*.prof
+*.hp
+
+# Generated outputs (keep in git for showcase)
+# Uncomment if you want to gitignore generated images:
+# docs/*.png
+# docs/*.gif
+# docs/nbody/
+
+# Benchmark outputs
+*.html
+*.csv
+*.json
+
+# Temporary files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Assets (if large)
+# assets/*.png
