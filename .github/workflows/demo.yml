@@ -1,0 +1,153 @@
+name: Demo CI
+
+on:
+  push:
+    branches: [ demo/showcase, copilot/add-llvm-demo-package ]
+    paths:
+      - 'demo/**'
+      - '.github/workflows/demo.yml'
+  pull_request:
+    branches: [ demo/showcase, copilot/add-llvm-demo-package ]
+    paths:
+      - 'demo/**'
+  workflow_dispatch:
+
+jobs:
+  build-demo:
+    name: Build Demo - ${{ matrix.os }} GHC ${{ matrix.ghc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        ghc: ['9.4', '9.6']
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      
+      - uses: haskell-actions/setup@v2
+        id: setup-haskell
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: 'latest'
+      
+      - name: Install system dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libffi-dev
+      
+      - name: Cache cabal store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/store
+            ~/.cabal/packages
+            dist-newstyle
+          key: ${{ runner.os }}-${{ matrix.ghc }}-cabal-demo-${{ hashFiles('**/*.cabal', 'cabal.project') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.ghc }}-cabal-demo-
+            ${{ runner.os }}-${{ matrix.ghc }}-cabal-
+      
+      - name: Update cabal package list
+        run: cabal update
+      
+      - name: Clone submodules
+        run: git submodule update --init --recursive
+      
+      - name: Configure
+        run: cabal configure --enable-tests --enable-benchmarks
+      
+      - name: Build dependencies
+        run: |
+          cabal build accelerate-llvm --only-dependencies
+          cabal build accelerate-llvm-native --only-dependencies
+      
+      - name: Build accelerate-llvm
+        run: cabal build accelerate-llvm
+      
+      - name: Build accelerate-llvm-native
+        run: cabal build accelerate-llvm-native
+      
+      - name: Build demo package
+        run: cabal build accelerate-llvm-demo
+      
+      - name: Run tests
+        run: cabal test demo-tests --test-show-details=direct
+      
+      - name: Create sample asset
+        run: |
+          mkdir -p demo/assets
+          # Create a simple test image using ImageMagick if available, otherwise skip
+          if command -v convert &> /dev/null; then
+            convert -size 256x256 gradient:blue-red demo/assets/sample.png
+          else
+            echo "Skipping sample image creation (ImageMagick not available)"
+          fi
+      
+      - name: Run Mandelbrot demo (small)
+        run: |
+          mkdir -p demo/docs
+          cabal run accelerate-llvm-demo -- mandelbrot \
+            --width 512 --height 384 \
+            --iterations 100 \
+            --output demo/docs/mandelbrot.png \
+            --backend cpu
+      
+      - name: Run N-body demo (small)
+        run: |
+          mkdir -p demo/docs/nbody
+          cabal run accelerate-llvm-demo -- nbody \
+            --particles 50 \
+            --frames 5 \
+            --width 400 --height 300 \
+            --output demo/docs/nbody \
+            --backend cpu
+      
+      - name: Run benchmarks (quick)
+        run: |
+          cabal run demo-bench -- --quick
+        continue-on-error: true
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-outputs-${{ matrix.os }}-ghc${{ matrix.ghc }}
+          path: |
+            demo/docs/mandelbrot.png
+            demo/docs/nbody/*.png
+          if-no-files-found: warn
+  
+  pages:
+    needs: build-demo
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/demo/showcase' || github.ref == 'refs/heads/copilot/add-llvm-demo-package'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: demo-outputs-*
+          merge-multiple: true
+          path: demo/docs
+      
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/docs
+      
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
