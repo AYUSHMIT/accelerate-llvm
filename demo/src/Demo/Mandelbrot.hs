@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeOperators #-}
 
 module Demo.Mandelbrot
@@ -13,6 +14,7 @@ import qualified Codec.Picture                            as JP
 import qualified Codec.Picture.Types                      as JP
 import qualified Data.Vector.Storable                     as VS
 import Data.Word                                          (Word8)
+import Prelude                                            as P
 
 -- | Mandelbrot set computation parameters
 type R = Float
@@ -31,14 +33,14 @@ mandelbrot depth xmin xmax ymin ymax c =
     -- Scale point to view coordinates
     x = xmin + A.real c * (xmax - xmin)
     y = ymin + A.imag c * (ymax - ymin)
-    z0 = lift (x :+ y)
+    z0 = lift (x :+ y) :: Exp (Complex R)
   in
     A.snd $ A.while
-      (\zi -> let (_, i) = unlift zi
-              in  i < depth A.&& magnitude2 (A.fst zi) < 4.0)
-      (\zi -> let (z, i) = unlift zi
-              in  lift (z * z + z0, i + 1))
-      (lift (z0, constant 0 :: Exp Int))
+      (\zi -> let (_, i) = unlift zi :: (Exp (Complex R), Exp Int)
+              in  i A.< depth A.&& magnitude2 (A.fst zi) A.< 4.0)
+      (\zi -> let (z, i) = unlift zi :: (Exp (Complex R), Exp Int)
+              in  lift (z * z + z0, i + constant 1) :: Exp (Complex R, Int))
+      (lift (z0, constant 0) :: Exp (Complex R, Int))
 
 -- | Magnitude squared of a complex number
 magnitude2 :: Exp (Complex R) -> Exp R
@@ -78,7 +80,7 @@ iterToRGB :: Int -> Int -> (Word8, Word8, Word8)
 iterToRGB maxIter iter
   | iter >= maxIter = (0, 0, 0)
   | otherwise =
-      let t = fromIntegral iter / fromIntegral maxIter
+      let t = fromIntegral iter / fromIntegral maxIter :: Double
           r = floor $ 255 * (0.5 + 0.5 * cos (3.0 * pi * t))
           g = floor $ 255 * (0.5 + 0.5 * cos (3.0 * pi * t + 2.0 * pi / 3.0))
           b = floor $ 255 * (0.5 + 0.5 * cos (3.0 * pi * t + 4.0 * pi / 3.0))
@@ -89,11 +91,11 @@ renderMandelbrot :: Int -> Array DIM2 Int -> JP.Image JP.PixelRGB8
 renderMandelbrot maxIter arr =
   let Z :. h :. w = arrayShape arr
       pixels = VS.generate (w * h * 3) $ \i ->
-        let pixelIdx = i `div` 3
-            component = i `mod` 3
-            y = pixelIdx `div` w
-            x = pixelIdx `mod` w
-            iter = arr ! (Z :. y :. x)
+        let pixelIdx = i `P.div` 3
+            component = i `P.mod` 3
+            y = pixelIdx `P.div` w
+            x = pixelIdx `P.mod` w
+            iter = indexArray arr (Z :. y :. x)
             (r, g, b) = iterToRGB maxIter iter
         in case component of
              0 -> r

@@ -10,3 +10,10 @@ source-repository-package
     tag:      a35d10c869f8b2e4c6cdd8c20bfd5548e891d16e
     -- Required for Cabal < 3.8
     -- post-checkout-command: bash -c "! git submodule update --init --recursive"
+
+-- Allow newer versions for GHC 9.12+
+allow-newer: 
+  accelerate:base,
+  accelerate:template-haskell,
+  *:base,
+  *:template-haskell
