@@ -1,8 +1,7 @@
-{-# LANGUAGE CPP               #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE TypeFamilies      #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -Wno-orphans   #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.PTX.Link
 -- Copyright   : [2017..2020] The Accelerate Team
@@ -37,11 +36,12 @@ import qualified Data.Array.Accelerate.LLVM.PTX.Debug               as Debug
 import qualified Foreign.CUDA.Analysis                              as CUDA
 import qualified Foreign.CUDA.Driver                                as CUDA
 
-import Control.Monad.State
+import Control.Monad.Reader
 import Data.ByteString.Short.Char8                                  ( ShortByteString, unpack )
 import Formatting
 import Foreign.Ptr
-import Language.Haskell.TH.Extra
+import Data.Array.Accelerate.TH.Compat
+import qualified Data.ByteString                                    as B
 import qualified Data.ByteString.Unsafe                             as B
 import Prelude                                                      as P hiding ( lookup )
 
@@ -55,11 +55,12 @@ instance Link PTX where
 -- | Load the generated object code into the current CUDA context.
 --
 link :: ObjectR PTX -> LLVM PTX (ExecutableR PTX)
-link (ObjectR uid cfg obj) = do
-  target <- gets llvmTarget
-  cache  <- gets ptxKernelTable
+link (ObjectR uid cfg objFname) = do
+  target <- asks llvmTarget
+  cache  <- asks ptxKernelTable
   funs   <- liftIO $ dlsym uid cache $ do
     -- Load the SASS object code into the current CUDA context
+    obj <- B.readFile objFname
     jit <- B.unsafeUseAsCString obj $ \p -> CUDA.loadDataFromPtrEx (castPtr p) []
     let mdl = CUDA.jitModule jit
 
@@ -70,7 +71,8 @@ link (ObjectR uid cfg obj) = do
     -- Finalise the module by unloading it from the CUDA context
     addFinalizer oc $ do
       Debug.traceM Debug.dump_ld ("ld: unload module: " % formatFunctionTable) nm
-      withContext (ptxContext target) (CUDA.unload mdl)
+      contextFinalizeResource (ptxContext target) $
+        withContext (ptxContext target) (CUDA.unload mdl)
 
     return (nm, oc)
   --

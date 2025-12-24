@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications    #-}
@@ -34,7 +35,6 @@ module Data.Array.Accelerate.LLVM.CodeGen.Base (
 
 ) where
 
-import LLVM.AST.Type.AddrSpace
 import LLVM.AST.Type.Constant
 import LLVM.AST.Type.Downcast
 import LLVM.AST.Type.Function
@@ -46,6 +46,7 @@ import LLVM.AST.Type.Name
 import LLVM.AST.Type.Operand
 import LLVM.AST.Type.Representation
 
+import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.LLVM.CodeGen.Environment
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
@@ -55,7 +56,7 @@ import Data.Array.Accelerate.Representation.Shape
 import Data.Array.Accelerate.Representation.Type
 import {-# SOURCE #-} Data.Array.Accelerate.LLVM.CodeGen.Exp
 
-import qualified LLVM.AST.Global                                    as LLVM
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty     as LP
 
 import Data.Monoid
 import Data.String
@@ -117,7 +118,7 @@ irArray repr@(ArrayR shr tp) n
 mutableArray
     :: ArrayR (Array sh e)
     -> Name (Array sh e)
-    -> (IRArray (Array sh e), [LLVM.Parameter])
+    -> (IRArray (Array sh e), [LP.Typed LP.Ident])
 mutableArray repr name =
   ( irArray repr name
   , arrayParam repr name )
@@ -129,7 +130,7 @@ mutableArray repr name =
 delayedArray
     :: Name (Array sh e)
     -> MIRDelayed arch aenv (Array sh e)
-    -> (IRDelayed arch aenv (Array sh e), [LLVM.Parameter])
+    -> (IRDelayed arch aenv (Array sh e), [LP.Typed LP.Ident])
 delayedArray name = \case
   IRDelayedJust a -> (a, [])
   IRDelayedNothing repr ->
@@ -197,29 +198,45 @@ travTypeToOperands tp f = snd $ go tp 0
 -- Function parameters
 -- -------------------
 
--- | Call a global function. The function declaration is inserted into the
--- symbol table.
+-- | Call a global function.
+--
+-- If the function being called has a special prefix (see 'labelIsAccPrelude'),
+-- the call instruction is generated as-is; otherwise (the common case), a
+-- function declaration is also inserted into the symbol table, resulting in a
+-- 'declare' statement in the LLVM module. A special prelude function is
+-- currently not allowed to have any function attributes.
+--
+-- TODO: The original llvm-hs code put function attributes both on the external
+-- function declaration and on the call instruction; this code puts them only
+-- on the declaration. We should compare LLVM IR / benchmark to see if this is
+-- an issue (@llvm-pretty@ does not yet support function attributes on call
+-- instructions).
 --
 call :: GlobalFunction args t -> [FunctionAttribute] -> CodeGen arch (Operands t)
 call f attrs = do
-  let decl      = (downcast f) { LLVM.functionAttributes = downcast attrs' }
-      attrs'    = map Right attrs
+  let decl      = (downcast f) { LP.decAttrs = downcast attrs }
       --
-      go :: GlobalFunction args t -> Function (Either InlineAssembly Label) args t
-      go (Body t k l) = Body t k (Right l)
-      go (Lam t x l)  = Lam t x (go l)
+      go :: GlobalFunction args t -> (Label, Function (Either InlineAssembly Label) args t)
+      go (Body t k l) = (l, Body t k (Right l))
+      go (Lam t x l)  = Lam t x <$> go l
   --
-  declare decl
-  instr (Call (go f) attrs')
+  let (lab, f') = go f
+  if labelIsAccPrelude lab
+    then case attrs of
+           [] -> return ()
+           _ -> internalError "Function attributes passed to a call to an acc prelude LLVM function"
+    else declareExternFunc decl
+
+  instr (Call f')
 
 
-parameter :: TypeR t -> Name t -> [LLVM.Parameter]
-parameter tp n = travTypeToList tp (\s i -> scalarParameter s (rename n i))
+parameter :: TypeR t -> Name t -> [LP.Typed LP.Ident]
+parameter tp n = travTypeToList tp (\s i -> LP.Typed (downcast s) (nameToPrettyI (rename n i)))
 
-scalarParameter :: ScalarType t -> Name t -> LLVM.Parameter
+scalarParameter :: ScalarType t -> Name t -> LP.Typed LP.Ident
 scalarParameter t x = downcast (Parameter (ScalarPrimType t) x)
 
-ptrParameter :: ScalarType t -> Name (Ptr t) -> LLVM.Parameter
+ptrParameter :: ScalarType t -> Name (Ptr t) -> LP.Typed LP.Ident
 ptrParameter t x = downcast (Parameter (PtrPrimType (ScalarPrimType t) defaultAddrSpace) x)
 
 
@@ -227,11 +244,8 @@ ptrParameter t x = downcast (Parameter (PtrPrimType (ScalarPrimType t) defaultAd
 -- The environment here refers only to the actual free array variables that are
 -- accessed by the function.
 --
-envParam :: forall aenv. Gamma aenv -> [LLVM.Parameter]
-envParam aenv = concatMap (\(Label n, Idx' repr _) -> toParam repr (Name n)) (IM.elems aenv)
-  where
-    toParam :: ArrayR (Array sh e) -> Name (Array sh e) -> [LLVM.Parameter]
-    toParam repr name = arrayParam repr name
+envParam :: forall aenv. Gamma aenv -> [LP.Typed LP.Ident]
+envParam aenv = concatMap (\(Label n, Idx' repr _) -> arrayParam repr (Name n)) (IM.elems aenv)
 
 
 -- | Generate function parameters for an Array with given base name.
@@ -240,7 +254,7 @@ envParam aenv = concatMap (\(Label n, Idx' repr _) -> toParam repr (Name n)) (IM
 arrayParam
     :: ArrayR (Array sh e)
     -> Name (Array sh e)
-    -> [LLVM.Parameter]
+    -> [LP.Typed LP.Ident]
 arrayParam (ArrayR shr tp) name = ad ++ sh
   where
     ad = travTypeToList tp              (\t i -> ptrParameter    t (arrayName name i))

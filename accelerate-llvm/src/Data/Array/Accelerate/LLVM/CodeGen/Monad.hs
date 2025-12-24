@@ -22,9 +22,13 @@ module Data.Array.Accelerate.LLVM.CodeGen.Monad (
   evalCodeGen,
   liftCodeGen,
 
+  -- codegen context
+  getLLVMversion,
+
   -- declarations
   fresh, freshLocalName, freshGlobalName,
-  declare,
+  declareGlobalVar,
+  declareExternFunc,
   typedef,
   intrinsic,
 
@@ -46,13 +50,12 @@ import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Intrinsic
 import Data.Array.Accelerate.LLVM.CodeGen.Module
 import Data.Array.Accelerate.LLVM.CodeGen.Sugar                     ( IROpenAcc(..) )
-import Data.Array.Accelerate.LLVM.State                             ( LLVM )
+import Data.Array.Accelerate.LLVM.State                             ( LLVM, getLLVMVer )
 import Data.Array.Accelerate.LLVM.Target
 import Data.Array.Accelerate.Representation.Tag
 import Data.Array.Accelerate.Representation.Type
 import qualified Data.Array.Accelerate.Debug.Internal               as Debug
 
-import LLVM.AST.Orphans                                             ()
 import LLVM.AST.Type.Constant
 import LLVM.AST.Type.Downcast
 import LLVM.AST.Type.Instruction
@@ -61,13 +64,16 @@ import LLVM.AST.Type.Name
 import LLVM.AST.Type.Operand
 import LLVM.AST.Type.Representation
 import LLVM.AST.Type.Terminator
-import qualified LLVM.AST                                           as LLVM
-import qualified LLVM.AST.Global                                    as LLVM
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty     as LP
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty.PP  as LP
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty.Triple.Parse as LP
 
 import Control.Applicative
 import Control.Monad
+import Control.Monad.Reader                                         ( ReaderT, MonadReader, runReaderT, asks )
 import Control.Monad.State
 import Data.ByteString.Short                                        ( ShortByteString )
+import qualified Data.ByteString.Short.Char8                        as SBS8
 import Data.Function
 import Data.HashMap.Strict                                          ( HashMap )
 import Data.Sequence                                                ( Seq )
@@ -77,6 +83,7 @@ import Formatting
 import Prelude
 import qualified Data.Foldable                                      as F
 import qualified Data.HashMap.Strict                                as HashMap
+import qualified Data.Map.Strict                                    as Map
 import qualified Data.Sequence                                      as Seq
 import qualified Data.ByteString.Short                              as B
 
@@ -91,8 +98,9 @@ import qualified Data.ByteString.Short                              as B
 --
 data CodeGenState = CodeGenState
   { blockChain          :: Seq Block                                      -- blocks for this function
-  , symbolTable         :: HashMap Label LLVM.Global                      -- global (external) function declarations
-  , typedefTable        :: HashMap Label (Maybe LLVM.Type)                -- global type definitions
+  , globalvarTable      :: HashMap Label LP.Global                        -- global variable definitions
+  , fundeclTable        :: HashMap Label LP.Declare                       -- global (external) function declarations
+  , typedefTable        :: HashMap Label LP.Type                          -- global type definitions
   , metadataTable       :: HashMap ShortByteString (Seq [Maybe Metadata]) -- module metadata to be collected
   , intrinsicTable      :: HashMap ShortByteString Label                  -- standard math intrinsic functions
   , local               :: {-# UNPACK #-} !Word                           -- a name supply
@@ -100,16 +108,26 @@ data CodeGenState = CodeGenState
   }
 
 data Block = Block
-  { blockLabel          :: {-# UNPACK #-} !Label                          -- block label
-  , instructions        :: Seq (LLVM.Named LLVM.Instruction)              -- stack of instructions
-  , terminator          :: LLVM.Terminator                                -- block terminator
+  { blockLabel          :: {-# UNPACK #-} !Label -- block label
+  , instructions        :: Seq LP.Stmt           -- stack of instructions
+  , terminator          :: LP.Stmt               -- block terminator
   }
 
-newtype CodeGen target a = CodeGen { runCodeGen :: StateT CodeGenState (LLVM target) a }
-  deriving (Functor, Applicative, Monad, MonadState CodeGenState)
+-- | Code generation context: read-only additional context of the compilation.
+--
+-- This contains the LLVM version.
+data CodeGenContext = CodeGenContext
+  { codegenLLVMversion :: LP.LLVMVer }
+
+newtype CodeGen target a = CodeGen
+  { runCodeGen :: ReaderT CodeGenContext (StateT CodeGenState (LLVM target)) a }
+  deriving (Functor, Applicative, Monad, MonadReader CodeGenContext, MonadState CodeGenState)
 
 liftCodeGen :: LLVM arch a -> CodeGen arch a
-liftCodeGen = CodeGen . lift
+liftCodeGen = CodeGen . lift . lift
+
+getLLVMversion :: CodeGen arch LP.LLVMVer
+getLLVMversion = asks codegenLLVMversion
 
 
 {-# INLINEABLE evalCodeGen #-}
@@ -118,10 +136,14 @@ evalCodeGen
     => CodeGen arch (IROpenAcc arch aenv a)
     -> LLVM    arch (Module    arch aenv a)
 evalCodeGen ll = do
-  (IROpenAcc ks, st)   <- runStateT (runCodeGen ll)
+  llvmver <- getLLVMVer
+  let context = CodeGenContext
+        { codegenLLVMversion = llvmver }
+  (IROpenAcc ks, st)   <- runStateT (runReaderT (runCodeGen ll) context)
                         $ CodeGenState
                             { blockChain        = initBlockChain
-                            , symbolTable       = HashMap.empty
+                            , globalvarTable    = HashMap.empty
+                            , fundeclTable      = HashMap.empty
                             , typedefTable      = HashMap.empty
                             , metadataTable     = HashMap.empty
                             , intrinsicTable    = intrinsicForTarget @arch
@@ -129,28 +151,31 @@ evalCodeGen ll = do
                             , global            = 0
                             }
 
-  let (kernels, md)     = let (fs, as) = unzip [ (f , (LLVM.name f, a)) | Kernel f a <- ks ]
-                          in  (fs, HashMap.fromList as)
+  let (kernels, md)     = let (fs, as) = unzip [ (f , (LP.defName f, a)) | Kernel f a <- ks ]
+                          in  (fs, Map.fromList as)
 
-      createTypedefs    = map (\(n,t) -> LLVM.TypeDefinition (downcast n) t) . HashMap.toList
+      createTypedefs    = map (\(n,t) -> LP.TypeDecl (labelToPrettyI n) t) . HashMap.toList
 
-      definitions       = createTypedefs (typedefTable st)
-                       ++ map LLVM.GlobalDefinition (kernels ++ HashMap.elems (symbolTable st))
-                       ++ createMetadata (metadataTable st)
-
-      name | x:_               <- kernels
-           , f@LLVM.Function{} <- x
-           , LLVM.Name s       <- LLVM.name f = s
-           | otherwise                        = "<undefined>"
+      (namedMd, unnamedMd) = createMetadata (metadataTable st)
 
   return $
     Module { moduleMetadata = md
-           , unModule       = LLVM.Module
-                            { LLVM.moduleName           = name
-                            , LLVM.moduleSourceFileName = B.empty
-                            , LLVM.moduleDataLayout     = targetDataLayout @arch
-                            , LLVM.moduleTargetTriple   = targetTriple @arch
-                            , LLVM.moduleDefinitions    = definitions
+           , unModule       = LP.Module
+                            { LP.modSourceName = Nothing
+                            , LP.modDataLayout = []  -- TODO: targetDataLayout @arch; this will be important for PTX
+                            , LP.modTriple     =
+                                case targetTriple @arch of
+                                  Just s -> LP.parseTriple (SBS8.unpack s)
+                                  Nothing -> error "TODO: module target triple"
+                            , LP.modTypes      = createTypedefs (typedefTable st)
+                            , LP.modNamedMd    = namedMd
+                            , LP.modUnnamedMd  = unnamedMd
+                            , LP.modComdat     = mempty
+                            , LP.modGlobals    = HashMap.elems (globalvarTable st)
+                            , LP.modDeclares   = HashMap.elems (fundeclTable st)
+                            , LP.modDefines    = kernels
+                            , LP.modInlineAsm  = []
+                            , LP.modAliases    = []
                             }
            }
 
@@ -225,7 +250,7 @@ beginBlock nm = do
 -- body. The block stream is re-initialised, but module-level state such as the
 -- global symbol table is left intact.
 --
-createBlocks :: HasCallStack => CodeGen arch [LLVM.BasicBlock]
+createBlocks :: HasCallStack => CodeGen arch [LP.BasicBlock]
 createBlocks
   = state
   $ \s -> let s'     = s { blockChain = initBlockChain, local = 0 }
@@ -236,7 +261,7 @@ createBlocks
           trace (bformat ("generated " % int % " instructions in " % int % " blocks") (n+m) m) ( F.toList blocks , s' )
   where
     makeBlock Block{..} =
-      LLVM.BasicBlock (downcast blockLabel) (F.toList instructions) (LLVM.Do terminator)
+      LP.BasicBlock (Just (labelToPrettyBL blockLabel)) (F.toList instructions ++ [terminator])
 
 
 -- Instructions
@@ -277,17 +302,17 @@ instr' ins =
     --
     ty -> do
       name <- freshLocalName
-      instr_ $ downcast (name := ins)
+      instr_ $ LP.Result (nameToPrettyI name) (downcast ins) [] []
       return $ LocalReference ty name
 
 -- | Execute an unnamed instruction
 --
 do_ :: HasCallStack => Instruction () -> CodeGen arch ()
-do_ ins = instr_ $ downcast (Do ins)
+do_ ins = instr_ $ LP.Effect (downcast ins) [] []
 
 -- | Add raw assembly instructions to the execution stream
 --
-instr_ :: HasCallStack => LLVM.Named LLVM.Instruction -> CodeGen arch ()
+instr_ :: HasCallStack => LP.Stmt -> CodeGen arch ()
 instr_ ins =
   modify $ \s ->
     case Seq.viewr (blockChain s) of
@@ -349,7 +374,7 @@ phi' tp target = go tp
 phi1 :: HasCallStack => Block -> Name a -> [(Operand a, Block)] -> CodeGen arch (Operand a)
 phi1 target crit incoming =
   let cmp       = (==) `on` blockLabel
-      update b  = b { instructions = downcast (crit := Phi t [ (p,blockLabel) | (p,Block{..}) <- incoming ]) Seq.<| instructions b }
+      update b  = b { instructions = LP.Result (nameToPrettyI crit) (downcast $ Phi t [ (p,blockLabel) | (p,Block{..}) <- incoming ]) [] [] Seq.<| instructions b }
       t         = case incoming of
                     []        -> internalError "no incoming values specified"
                     (o,_):_   -> case typeOf o of
@@ -371,27 +396,40 @@ terminate term =
   state $ \s ->
     case Seq.viewr (blockChain s) of
       Seq.EmptyR  -> internalError "empty block chain"
-      bs Seq.:> b -> ( b, s { blockChain = bs Seq.|> b { terminator = downcast term } } )
+      bs Seq.:> b -> ( b, s { blockChain = bs Seq.|> b { terminator = LP.Effect (downcast term) [] [] } } )
 
 
--- | Add a global declaration to the symbol table
+-- | Add a global variable declaration to the module
 --
-declare :: HasCallStack => LLVM.Global -> CodeGen arch ()
-declare g =
+declareGlobalVar :: HasCallStack => LP.Global -> CodeGen arch ()
+declareGlobalVar g =
   let unique (Just q) | g /= q    = internalError "duplicate symbol"
                       | otherwise = Just g
       unique _                    = Just g
 
-      name = case LLVM.name g of
-               LLVM.Name n      -> Label n
-               LLVM.UnName n    -> Label (fromString (show n))
+      name = case LP.globalSym g of
+               LP.Symbol n -> Label (fromString n)
   in
-  modify (\s -> s { symbolTable = HashMap.alter unique name (symbolTable s) })
+  modify (\s -> s { globalvarTable = HashMap.alter unique name (globalvarTable s) })
+
+
+-- | Add an external function declaration to the module
+--
+declareExternFunc :: HasCallStack => LP.Declare -> CodeGen arch ()
+declareExternFunc g =
+  let unique (Just q) | g /= q    = internalError "duplicate symbol"
+                      | otherwise = Just g
+      unique _                    = Just g
+
+      name = case LP.decName g of
+               LP.Symbol n -> Label (fromString n)
+  in
+  modify (\s -> s { fundeclTable = HashMap.alter unique name (fundeclTable s) })
 
 
 -- | Add a global type definition
 --
-typedef :: HasCallStack => Label -> Maybe LLVM.Type -> CodeGen arch ()
+typedef :: HasCallStack => Label -> LP.Type -> CodeGen arch ()
 typedef name t =
   let unique (Just s) | t /= s    = internalError "duplicate typedef"
                       | otherwise = Just t
@@ -427,24 +465,24 @@ addMetadata key val =
 -- represent the metadata node definitions that will be attached to that
 -- definition.
 --
-createMetadata :: HashMap ShortByteString (Seq [Maybe Metadata]) -> [LLVM.Definition]
+createMetadata :: HashMap ShortByteString (Seq [Maybe Metadata]) -> ([LP.NamedMd], [LP.UnnamedMd])
 createMetadata md = go (HashMap.toList md) (Seq.empty, Seq.empty)
   where
     go :: [(ShortByteString, Seq [Maybe Metadata])]
-       -> (Seq LLVM.Definition, Seq LLVM.Definition) -- accumulator of (names, metadata)
-       -> [LLVM.Definition]
-    go []     (k,d) = F.toList (k Seq.>< d)
+       -> (Seq LP.NamedMd, Seq LP.UnnamedMd) -- accumulator of (names, metadata)
+       -> ([LP.NamedMd], [LP.UnnamedMd])
+    go []     (k,d) = (F.toList k, F.toList d)
     go (x:xs) (k,d) =
       let (k',d') = meta (Seq.length d) x
       in  go xs (k Seq.|> k', d Seq.>< d')
 
     meta :: Int                                         -- number of metadata node definitions so far
          -> (ShortByteString, Seq [Maybe Metadata])     -- current assoc of the metadata map
-         -> (LLVM.Definition, Seq LLVM.Definition)
+         -> (LP.NamedMd, Seq LP.UnnamedMd)
     meta n (key, vals)
-      = let node i      = LLVM.MetadataNodeID (fromIntegral (i+n))
-            nodes       = Seq.mapWithIndex (\i x -> LLVM.MetadataNodeDefinition (node i) (downcast (F.toList x))) vals
-            name        = LLVM.NamedMetadataDefinition key [ node i | i <- [0 .. Seq.length vals - 1] ]
+      = let node i      = i + n
+            nodes       = Seq.mapWithIndex (\i x -> LP.UnnamedMd (node i) (LP.ValMdNode (downcast (F.toList x))) False) vals
+            name        = LP.NamedMd (SBS8.unpack key) [ node i | i <- [0 .. Seq.length vals - 1] ]
         in
         (name, nodes)
 

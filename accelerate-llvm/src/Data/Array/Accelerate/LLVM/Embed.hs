@@ -44,10 +44,10 @@ import Data.Array.Accelerate.LLVM.Link
 
 import Data.ByteString.Short                                        ( ShortByteString )
 import GHC.Ptr                                                      ( Ptr(..) )
-import Language.Haskell.TH.Extra                                    ( CodeQ )
+import Data.Array.Accelerate.TH.Compat                              ( CodeQ )
 import System.IO.Unsafe
 import qualified Data.ByteString.Short.Internal                     as BS
-import qualified Language.Haskell.TH.Extra                          as TH
+import qualified Data.Array.Accelerate.TH.Compat                    as TH
 
 #if MIN_VERSION_containers(0,5,9)
 import qualified Data.IntMap.Internal                               as IM
@@ -104,7 +104,11 @@ embedOpenAcc arch = liftA
         BuildAcc repr aenv obj pacc -> [|| ExecAcc $$(liftArraysR repr) $$(liftGamma aenv) $$(embedForTarget arch obj) $$(liftPreOpenAccSkeleton arch pacc) ||]
 
     liftGamma :: Gamma aenv' -> CodeQ (Gamma aenv')
-#if MIN_VERSION_containers(0,5,8)
+#if MIN_VERSION_containers(0,8,0)
+    liftGamma IM.Nil           = [|| IM.Nil ||]
+    liftGamma (IM.Bin p l r)   = [|| IM.Bin p $$(liftGamma l) $$(liftGamma r) ||]
+    liftGamma (IM.Tip k v)     = [|| IM.Tip k $$(liftV v) ||]
+#elif MIN_VERSION_containers(0,5,8)
     liftGamma IM.Nil           = [|| IM.Nil ||]
     liftGamma (IM.Bin p m l r) = [|| IM.Bin p m $$(liftGamma l) $$(liftGamma r) ||]
     liftGamma (IM.Tip k v)     = [|| IM.Tip k $$(liftV v) ||]

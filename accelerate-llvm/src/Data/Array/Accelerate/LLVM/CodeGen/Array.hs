@@ -24,7 +24,7 @@ import Control.Applicative
 import Prelude                                                      hiding ( read )
 import Data.Bits
 
-import LLVM.AST.Type.AddrSpace
+import LLVM.AST.Type.GetElementPtr
 import LLVM.AST.Type.Instruction
 import LLVM.AST.Type.Instruction.Volatile
 import LLVM.AST.Type.Operand
@@ -133,19 +133,22 @@ getElementPtr
     -> Operand (Ptr e)
     -> Operand int
     -> CodeGen arch (Operand (Ptr e))
-getElementPtr _ t@(SingleScalarType{})   _ arr ix = instr' $ GetElementPtr t arr [ix]
+getElementPtr _ t@(SingleScalarType{})   _ arr ix = instr' $ GetElementPtr $ GEP1 t arr ix
 getElementPtr a t@(VectorScalarType v) i arr ix
-  | VectorType n _ <- v
-  , IntegralDict   <- integralDict i
+  | VectorType n eltty <- v
+  , IntegralDict       <- integralDict i
   = if popCount n == 1
-       then instr' $ GetElementPtr t arr [ix]
+       then instr' $ GetElementPtr $ GEP1 t arr ix
        else do
           -- Note the initial zero into to the GEP instruction. It is not
           -- really recommended to use GEP to index into vector elements, but
-          -- is not forcefully disallowed (at this time)
-          ix'  <- instr' $ Mul (IntegralNumType i) ix (integral i (fromIntegral n))
-          p'   <- instr' $ GetElementPtr t arr [integral i 0, ix']
-          p    <- instr' $ PtrCast (PtrPrimType (ScalarPrimType (VectorScalarType v)) a) p'
+          -- is not forcefully disallowed (at this time).
+          -- Cast the <n x t>* to a t*, do a scaled GEP, and cast the resulting
+          -- t* back to an <n x t>*.
+          ix'    <- instr' $ Mul (IntegralNumType i) ix (integral i (fromIntegral n))
+          pPlain <- instr' $ PtrCast (PtrPrimType (ScalarPrimType (SingleScalarType eltty)) a) arr
+          p'     <- instr' $ GetElementPtr $ GEP1 (SingleScalarType eltty) pPlain ix'
+          p      <- instr' $ PtrCast (PtrPrimType (ScalarPrimType (VectorScalarType v)) a) p'
           return p
 
 
@@ -182,7 +185,7 @@ load addrspace e v p
          let go i w
                | i >= m    = return w
                | otherwise = do
-                   q  <- instr' $ GetElementPtr (SingleScalarType base) p' [integral integralType i]
+                   q  <- instr' $ GetElementPtr $ GEP1 (SingleScalarType base) p' (integral integralType i)
                    r  <- instr' $ Load (SingleScalarType base) v q
                    w' <- instr' $ InsertElement i w r
                    go (i+1) w'
@@ -215,7 +218,7 @@ store addrspace volatility e p v
                | i >= m    = return ()
                | otherwise = do
                    x <- instr' $ ExtractElement i v
-                   q <- instr' $ GetElementPtr (SingleScalarType base) p' [integral integralType i]
+                   q <- instr' $ GetElementPtr $ GEP1 (SingleScalarType base) p' (integral integralType i)
                    _ <- instr' $ Store volatility q x
                    go (i+1)
          go 0

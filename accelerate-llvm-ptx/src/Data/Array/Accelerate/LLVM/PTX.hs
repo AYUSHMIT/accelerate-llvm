@@ -1,6 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes  #-}
 {-# LANGUAGE BangPatterns         #-}
-{-# LANGUAGE CPP                  #-}
 {-# LANGUAGE FlexibleInstances    #-}
 {-# LANGUAGE GADTs                #-}
 {-# LANGUAGE OverloadedStrings    #-}
@@ -119,7 +118,7 @@ import Control.Monad.Trans
 import Data.Maybe
 import Formatting                                                   ( shown )
 import System.IO.Unsafe
-import qualified Language.Haskell.TH.Extra                          as TH
+import qualified Data.Array.Accelerate.TH.Compat                    as TH
 
 
 -- Accelerate: LLVM backend for NVIDIA GPUs

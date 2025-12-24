@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP                 #-}
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
@@ -45,18 +44,18 @@ import Data.Array.Accelerate.LLVM.PTX.CodeGen.Base
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Loop
 import Data.Array.Accelerate.LLVM.PTX.Target
 
-import LLVM.AST.Type.AddrSpace
 import LLVM.AST.Type.Instruction
 import LLVM.AST.Type.Instruction.Atomic
 import LLVM.AST.Type.Instruction.RMW                                as RMW
 import LLVM.AST.Type.Instruction.Volatile
+import LLVM.AST.Type.GetElementPtr
 import LLVM.AST.Type.Operand
 import LLVM.AST.Type.Representation
 
 import Foreign.CUDA.Analysis
 
 import Control.Monad                                                ( void )
-import Control.Monad.State                                          ( gets )
+import Control.Monad.Reader                                         ( asks )
 import Prelude
 
 
@@ -127,7 +126,7 @@ mkPermute_rmw
     -> MIRDelayed PTX aenv (Array sh e)
     -> CodeGen    PTX      (IROpenAcc PTX aenv (Array sh' e))
 mkPermute_rmw uid aenv (ArrayR shr tp) shr' rmw update project marr = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       outR                = ArrayR shr' tp
@@ -164,7 +163,7 @@ mkPermute_rmw uid aenv (ArrayR shr tp) shr' rmw update project marr = do
           _ | TupRsingle (SingleScalarType s)   <- tp
             , adata                             <- irArrayData arrOut
             -> do
-                  addr <- instr' $ GetElementPtr (SingleScalarType s) (asPtr defaultAddrSpace (op s adata)) [op integralType j]
+                  addr <- instr' $ GetElementPtr $ GEP1 (SingleScalarType s) (asPtr defaultAddrSpace (op s adata)) (op integralType j)
                   --
                   let
                       rmw_integral :: IntegralType t -> Operand (Ptr t) -> Operand t -> CodeGen PTX ()
@@ -268,7 +267,7 @@ atomically
     -> CodeGen PTX a
     -> CodeGen PTX a
 atomically barriers i action = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   if computeCapability dev >= Compute 7 0
      then atomically_thread barriers i action
      else atomically_warp   barriers i action
@@ -309,7 +308,7 @@ atomically_thread barriers i action = do
   exit  <- newBlock "spinlock.exit"
   ns    <- fresh i32
 
-  addr  <- instr' $ GetElementPtr scalarType (asPtr defaultAddrSpace (op integralType (irArrayData barriers))) [op integralType i]
+  addr  <- instr' $ GetElementPtr $ GEP1 scalarType (asPtr defaultAddrSpace (op integralType (irArrayData barriers))) (op integralType i)
   top   <- br entry
 
   -- Loop until this thread has completed its critical section. If the slot
@@ -407,7 +406,7 @@ atomically_warp barriers i action = do
   end   <- newBlock "spinlock.critical-end"
   exit  <- newBlock "spinlock.exit"
 
-  addr <- instr' $ GetElementPtr scalarType (asPtr defaultAddrSpace (op integralType (irArrayData barriers))) [op integralType i]
+  addr <- instr' $ GetElementPtr $ GEP1 scalarType (asPtr defaultAddrSpace (op integralType (irArrayData barriers))) (op integralType i)
   _    <- br entry
 
   -- Loop until this thread has completed its critical section. If the slot was

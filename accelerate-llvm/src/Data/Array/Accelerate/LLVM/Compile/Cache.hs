@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 {-# OPTIONS_HADDOCK hide #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.Compile.Cache
@@ -82,7 +81,10 @@ cacheOfUID uid = do
       (base, file)  = splitFileName template
       (name, ext)   = splitExtensions file
       --
-      cachepath     = appdir </> "accelerate-llvm-" ++ showVersion version </> base </> if debuggingIsEnabled then "dbg" else "rel"
+      tag | tracyIsEnabled = "tracy"
+          | debuggingIsEnabled = "dbg"
+          | otherwise = "rel"
+      cachepath     = appdir </> "accelerate-llvm-" ++ showVersion version </> base </> tag
       cachefile     = cachepath </> printf "%s%s" name (show uid) <.> ext
   --
   liftIO $ createDirectoryIfMissing True cachepath
